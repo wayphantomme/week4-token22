@@ -374,6 +374,224 @@ pub mod t22 {
         Ok(())
     }
 
+    // -----------------------------------------------------------------------
+    // REMITTANCE STABLECOIN — Task 5: re-issued mint
+    // -----------------------------------------------------------------------
+    //
+    // Why re-issue?
+    //   ConfidentialTransferMint cannot be added to an existing mint.
+    //   Extensions are initialized before InitializeMint2 and that call seals
+    //   the account. So to add confidential transfers, the original mint must
+    //   be retired and a new one created carrying all prior extensions plus
+    //   the new ones.
+    //
+    // This mint carries seven extensions:
+    //   MintCloseAuthority          — close the mint if decommissioned
+    //   MetadataPointer             — points to self; name/symbol live on-chain
+    //   TransferFeeConfig           — protocol fee on every transfer
+    //   DefaultAccountState         — new accounts start frozen until KYC
+    //   PermanentDelegate           — seizure authority
+    //   ConfidentialTransferMint    — amounts encrypted; approve_policy = manual
+    //   ConfidentialTransferFeeConfig — required whenever TransferFeeConfig
+    //                                   and ConfidentialTransferMint coexist;
+    //                                   Token-2022 rejects the combination
+    //                                   without it. Withheld fees on
+    //                                   confidential transfers are encrypted
+    //                                   under the fee authority's ElGamal key.
+    //
+    // approve_policy = manual means the confidential_transfer_authority must
+    // call ApproveAccount after every ConfigureAccount. That authority is a
+    // separate signer — not automatically the mint authority or the payer.
+    //
+    // Account lifecycle after this mint:
+    //   1. create_account + initialize_account3  (anyone can pay)
+    //   2. thaw_remittance_account               (freeze authority, after KYC)
+    //   3. ConfigureAccount                      (owner only)
+    //   4. approve_confidential_account          (confidential_transfer_authority)
+    //   5. deposit / transfer / withdraw
+    pub fn create_remittance_confidential_mint(
+        ctx: Context<CreateRemittanceConfidentialMint>,
+        decimals: u8,
+        basis_points: u16,
+        maximum_fee: u64,
+        // The fee authority's ElGamal pubkey. Withheld fees on confidential
+        // transfers are encrypted under this key; only the holder of the
+        // matching secret key can read them. Required by
+        // ConfidentialTransferFeeConfig.
+        withdraw_withheld_authority_elgamal_pubkey: [u8; 32],
+    ) -> Result<()> {
+        let extensions = [
+            ExtensionType::MintCloseAuthority,
+            ExtensionType::MetadataPointer,
+            ExtensionType::TransferFeeConfig,
+            ExtensionType::DefaultAccountState,
+            ExtensionType::PermanentDelegate,
+            ExtensionType::ConfidentialTransferMint,
+            ExtensionType::ConfidentialTransferFeeConfig,
+        ];
+
+        let space = ExtensionType::try_calculate_account_len::<MintState>(&extensions)?;
+        let lamports = Rent::get()?.minimum_balance(space);
+
+        anchor_lang::system_program::create_account(
+            CpiContext::new(
+                ctx.accounts.system_program.key(),
+                anchor_lang::system_program::CreateAccount {
+                    from: ctx.accounts.payer.to_account_info(),
+                    to: ctx.accounts.mint.to_account_info(),
+                },
+            ),
+            lamports,
+            space as u64,
+            &ctx.accounts.token_program.key(),
+        )?;
+
+        let mint_key    = ctx.accounts.mint.key();
+        let payer_key   = ctx.accounts.payer.key();
+        let freeze_key  = ctx.accounts.freeze_authority.key();
+        let ct_auth_key = ctx.accounts.confidential_transfer_authority.key();
+        let mint_info   = ctx.accounts.mint.to_account_info();
+        let prog_info   = ctx.accounts.token_program.to_account_info();
+
+        // --- extension initializers, all before InitializeMint2 ---
+
+        mint_close_authority_initialize(
+            CpiContext::new(
+                prog_info.key(),
+                MintCloseAuthorityInitialize {
+                    token_program_id: prog_info.clone(),
+                    mint: mint_info.clone(),
+                },
+            ),
+            Some(&payer_key),
+        )?;
+
+        invoke(
+            &initialize_metadata_pointer(
+                &prog_info.key(),
+                &mint_key,
+                Some(payer_key),
+                Some(mint_key),
+            )?,
+            &[mint_info.clone(), prog_info.clone()],
+        )?;
+
+        transfer_fee_initialize(
+            CpiContext::new(
+                prog_info.key(),
+                TransferFeeInitialize {
+                    token_program_id: prog_info.clone(),
+                    mint: mint_info.clone(),
+                },
+            ),
+            Some(&payer_key),
+            Some(&payer_key),
+            basis_points,
+            maximum_fee,
+        )?;
+
+        invoke(
+            &initialize_default_account_state(
+                &prog_info.key(),
+                &mint_key,
+                &AccountState::Frozen,
+            )?,
+            &[mint_info.clone(), prog_info.clone()],
+        )?;
+
+        invoke(
+            &spl_token_2022::instruction::initialize_permanent_delegate(
+                &prog_info.key(),
+                &mint_key,
+                &payer_key,
+            )?,
+            &[mint_info.clone(), prog_info.clone()],
+        )?;
+
+        // ConfidentialTransferMint: auto_approve = false enforces manual
+        // approval. ct_auth_key signs ApproveAccount, stored in the extension.
+        invoke(
+            &confidential_instruction::initialize_mint(
+                &prog_info.key(),
+                &mint_key,
+                Some(ct_auth_key),
+                false, // approve_policy = manual
+                None,  // no auditor key
+            )?,
+            &[mint_info.clone(), prog_info.clone()],
+        )?;
+
+        // ConfidentialTransferFeeConfig must come after ConfidentialTransferMint.
+        // Token-2022 checks that CT mint config already exists before writing
+        // the fee config. Reverse order causes "invalid extension combination".
+        invoke(
+            &confidential_fee_instruction::initialize_confidential_transfer_fee_config(
+                &prog_info.key(),
+                &mint_key,
+                Some(payer_key),
+                &withdraw_withheld_authority_elgamal_pubkey.into(),
+            )?,
+            &[mint_info.clone(), prog_info.clone()],
+        )?;
+
+        // InitializeMint2 last — seals the account.
+        invoke(
+            &raw_initialize_mint2(
+                &prog_info.key(),
+                &mint_key,
+                &payer_key,
+                Some(&freeze_key),
+                decimals,
+            )?,
+            &[mint_info.clone(), prog_info.clone()],
+        )?;
+
+        msg!(
+            "confidential remittance mint {} — {} bytes, {} bps fee, manual CT approval",
+            mint_key, space, basis_points
+        );
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // REMITTANCE STABLECOIN — Task 5: approve confidential account
+    // -----------------------------------------------------------------------
+    //
+    // With approve_policy = manual, ConfigureAccount puts the account in a
+    // pending state. It cannot send or receive confidential transfers until
+    // the confidential_transfer_authority calls ApproveAccount.
+    //
+    // This authority is whoever was passed as the authority argument to
+    // initialize_mint above. It lives in ConfidentialTransferMint.authority
+    // on the mint — readable via StateWithExtensions. It is NOT the payer,
+    // NOT the mint authority, unless you explicitly set them the same.
+    //
+    // The separation matters: the issuer (mint authority) manages supply;
+    // the KYC/compliance operator (CT authority) gates confidential access.
+    // These can be different keys held by different people.
+    pub fn approve_confidential_account(
+        ctx: Context<ApproveConfidentialAccount>,
+    ) -> Result<()> {
+        let ix = confidential_instruction::approve_account(
+            &ctx.accounts.token_program.key(),
+            &ctx.accounts.token_account.key(),
+            &ctx.accounts.mint.key(),
+            &ctx.accounts.confidential_transfer_authority.key(),
+            &[],
+        )?;
+        invoke(
+            &ix,
+            &[
+                ctx.accounts.token_account.to_account_info(),
+                ctx.accounts.mint.to_account_info(),
+                ctx.accounts.confidential_transfer_authority.to_account_info(),
+                ctx.accounts.token_program.to_account_info(),
+            ],
+        )?;
+        msg!("confidential account {} approved", ctx.accounts.token_account.key());
+        Ok(())
+    }
+
     /// `InterfaceAccount<'info, Mint>` looks like it gives you the whole mint.
     /// It does not. Anchor's deserializer runs
     /// `StateWithExtensions::unpack(buf).map(|t| Mint(t.base))`, which parses
@@ -956,6 +1174,47 @@ pub struct ThawRemittanceAccount<'info> {
 
     /// Must be the mint's freeze authority — Token-2022 enforces this.
     pub freeze_authority: Signer<'info>,
+
+    pub token_program: Interface<'info, TokenInterface>,
+}
+
+#[derive(Accounts)]
+pub struct CreateRemittanceConfidentialMint<'info> {
+    #[account(mut)]
+    pub payer: Signer<'info>,
+
+    /// Freeze authority — thaws individual accounts after KYC.
+    /// CHECK: stored as freeze_authority in InitializeMint2.
+    pub freeze_authority: Signer<'info>,
+
+    /// Confidential transfer authority — signs ApproveAccount.
+    /// Stored in ConfidentialTransferMint.authority. NOT the payer or mint
+    /// authority unless you explicitly pass the same key.
+    /// CHECK: stored in ConfidentialTransferMint extension.
+    pub confidential_transfer_authority: Signer<'info>,
+
+    /// CHECK: created and initialized in the handler.
+    #[account(mut, signer)]
+    pub mint: UncheckedAccount<'info>,
+
+    pub token_program: Interface<'info, TokenInterface>,
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct ApproveConfidentialAccount<'info> {
+    /// The token account to approve for confidential transfers.
+    /// CHECK: validated by Token-2022 during ApproveAccount.
+    #[account(mut, owner = token_program.key())]
+    pub token_account: UncheckedAccount<'info>,
+
+    /// CHECK: validated by Token-2022.
+    #[account(owner = token_program.key())]
+    pub mint: UncheckedAccount<'info>,
+
+    /// Must match ConfidentialTransferMint.authority stored on the mint.
+    /// Token-2022 reads that field and rejects any other signer.
+    pub confidential_transfer_authority: Signer<'info>,
 
     pub token_program: Interface<'info, TokenInterface>,
 }
