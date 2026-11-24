@@ -29,12 +29,9 @@ use t22::{accounts, instruction, ID};
 use t22new::{
     extension::{
         confidential_transfer::{instruction as ct_ix, ConfidentialTransferAccount, ConfidentialTransferMint},
-        confidential_transfer_fee::ConfidentialTransferFeeConfig,
-        default_account_state::DefaultAccountState,
-        metadata_pointer::MetadataPointer,
-        mint_close_authority::MintCloseAuthority,
         permanent_delegate::PermanentDelegate,
-        transfer_fee::TransferFeeConfig,
+        default_account_state::DefaultAccountState,
+        transfer_fee::TransferFeeAmount,
         BaseStateWithExtensions, ExtensionType, StateWithExtensions,
     },
     instruction::{initialize_account3, mint_to},
@@ -252,15 +249,12 @@ struct MintSetup {
     mint: Keypair,
     freeze_authority: Keypair,
     ct_authority: Keypair,
-    fee_elgamal: ElGamalKeypair,
 }
 
 fn create_ct_mint(svm: &mut LiteSVM, payer: &Keypair) -> MintSetup {
     let mint = Keypair::new();
     let freeze_authority = Keypair::new();
     let ct_authority = Keypair::new();
-    // Fee authority ElGamal keypair: withheld fees on confidential transfers
-    // are encrypted under this key. Derived from payer for simplicity.
     let (fee_elgamal, _) = derive_confidential_keys(payer, b"fee").unwrap();
     let fee_pubkey: [u8; 32] = fee_elgamal.pubkey().into();
 
@@ -277,7 +271,7 @@ fn create_ct_mint(svm: &mut LiteSVM, payer: &Keypair) -> MintSetup {
         &[&mint, &freeze_authority, &ct_authority],
     );
 
-    MintSetup { mint, freeze_authority, ct_authority, fee_elgamal }
+    MintSetup { mint, freeze_authority, ct_authority }
 }
 
 // ---------------------------------------------------------------------------
@@ -285,7 +279,7 @@ fn create_ct_mint(svm: &mut LiteSVM, payer: &Keypair) -> MintSetup {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn confidential_remittance_mint_has_all_six_extensions() {
+fn confidential_remittance_mint_has_all_seven_extensions() {
     let (mut svm, payer) = setup();
     let ms = create_ct_mint(&mut svm, &payer);
 
@@ -591,7 +585,12 @@ fn permanent_delegate_seizes_public_balance_without_consent() {
     let seizure_state = StateWithExtensions::<TokenAccountState>::unpack(&seizure_acct.data).unwrap();
 
     assert_eq!(victim_state.base.amount, 0, "victim should have 0 after seizure");
-    // 1% fee (50_000) is withheld in destination; destination receives 4_950_000.
+    // 1% fee (50_000) is withheld in destination. Recipient receives 4_950_000.
     assert_eq!(seizure_state.base.amount, 4_950_000, "destination should have amount minus 1% fee");
-    println!("permanent delegate seized 5_000_000 (4_950_000 credited after 1% fee) without victim consent ✓");
+
+    // The fee (50_000) must be recorded in TransferFeeAmount on the destination.
+    let fee_amount = seizure_state.get_extension::<TransferFeeAmount>().unwrap();
+    assert_eq!(u64::from(fee_amount.withheld_amount), 50_000, "withheld fee should be 50_000");
+
+    println!("permanent delegate seized 5_000_000: 4_950_000 credited, 50_000 withheld as fee ✓");
 }
